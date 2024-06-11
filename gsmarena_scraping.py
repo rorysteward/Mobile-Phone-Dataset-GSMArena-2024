@@ -3,155 +3,215 @@ from bs4 import BeautifulSoup
 import csv
 import os
 import time
-import json
+import subprocess
 
-# Class gsmarena scrap the website phones models and its devices and save to csv file individually.
-class Gsmarena():
-
-    # Constructor to initialize common useful varibales throughout the program.
+VULTR_API_KEY = 'ASDSADASDASDASDASDASDASDSA'
+SNAPSHOT_ID = 'ac5e4520-3e21-4703-91e4-9cerwrew'
+REGION = 'ewr'
+PLAN = 'vc2-1c-0.5gb'
+class Gsmarena:
     def __init__(self):
-        self.phones = []
-        self.features = ["Brand", "Model Name", "Model Image"]
-        self.temp1 = []
-        self.phones_brands = []
-        self.url = 'https://www.gsmarena.com/' # GSMArena website url
-        self.new_folder_name = 'GSMArenaDataset' # Folder name on which files going to save.
-        self.absolute_path = os.popen('pwd').read().strip() + '/' + self.new_folder_name  # It create the absolute path of the GSMArenaDataset folder.
+        self.url = 'https://www.gsmarena.com/'
+        self.new_folder_name = 'GSMArenaDataset'
+        self.absolute_path = os.path.join(os.getcwd(), self.new_folder_name)
+        self.max_retries = 5
+        self.current_instance_id = None
 
-    # This function crawl the html code of the requested URL.
-    def crawl_html_page(self, sub_url):
+    def create_vm(self):
+        print("Creating VM...")
+        url = 'https://api.vultr.com/v2/instances'
+        headers = {
+            'Authorization': f'Bearer {VULTR_API_KEY}',
+            'Content-Type': 'application/json'
+        }
+        data = {
+            'region': REGION,
+            'plan': PLAN,
+            'snapshot_id': SNAPSHOT_ID,
+            'enable_ipv6': False
+        }
+        response = requests.post(url, json=data, headers=headers)
+        if response.status_code == 202:
+            print("VM creation initiated successfully.")
+            instance_id = response.json()['instance']['id']
+            print("Waiting for VM to become operational...")
+            time.sleep(180)  # Adding delay for VM to become operational
+            return instance_id
+        else:
+            print(f"Failed to create VM: {response.status_code} {response.text}")
+            return None
 
-        url = self.url + sub_url  # Url for html content parsing.
-        header={"User-Agent":"#user agent of your system  "}
-        time.sleep(30)  #SO that your IP does not gets blocked by the website
-        # Handing the connection error of the url.
+    def get_vm_ip(self, instance_id):
+        print(f"Retrieving IP for VM {instance_id}...")
+        url = f'https://api.vultr.com/v2/instances/{instance_id}'
+        headers = {
+            'Authorization': f'Bearer {VULTR_API_KEY}'
+        }
+        for _ in range(30):  # Retry for up to 5 minutes
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                instance_info = response.json()
+                ip_address = instance_info['instance']['main_ip']
+                if ip_address and ip_address != '0.0.0.0':
+                    return ip_address
+            time.sleep(10)
+        print(f"Failed to retrieve VM IP for instance {instance_id}.")
+        return None
+
+    def dispose_vm(self, instance_id):
+        print(f"Disposing VM {instance_id}...")
+        url = f'https://api.vultr.com/v2/instances/{instance_id}'
+        headers = {
+            'Authorization': f'Bearer {VULTR_API_KEY}'
+        }
+        response = requests.delete(url, headers=headers)
+        if response.status_code == 204:
+            print(f"VM {instance_id} disposed successfully.")
+        else:
+            print(f"Failed to dispose VM: {response.status_code} {response.text}")
+
+    def update_openvpn_config(self, new_ip):
+        print(f"Updating OpenVPN config with new IP {new_ip}...")
+        config_file_path = '/etc/openvpn/client.conf'
+        with open(config_file_path, 'r') as file:
+            config_data = file.readlines()
+        
+        with open(config_file_path, 'w') as file:
+            for line in config_data:
+                if line.startswith('remote'):
+                    file.write(f'remote {new_ip} 1194\n')
+                else:
+                    file.write(line)
+
+    def restart_openvpn(self):
+        print("Restarting OpenVPN client...")
         try:
-            page = requests.get(url,timeout= 5, headers=header)
-            soup = BeautifulSoup(page.text, 'html.parser')  # It parses the html data from requested url.
-            return soup
+            result = subprocess.run(['systemctl', 'restart', 'openvpn@client'], check=True, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(result.returncode, result.args, output=result.stdout, stderr=result.stderr)
+            print("OpenVPN client restarted successfully.")
+            time.sleep(5)
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to restart OpenVPN client: {e.stderr}")
+            raise
 
-        except ConnectionError as err:
-            print("Please check your network connection and re-run the script.")
-            exit()
+    def stop_openvpn(self):
+        print("Stopping OpenVPN client...")
+        try:
+            result = subprocess.run(['systemctl', 'stop', 'openvpn@client'], check=True, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(result.returncode, result.args, output=result.stdout, stderr=result.stderr)
+            print("OpenVPN client stopped successfully.")
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to stop OpenVPN client: {e.stderr}")
+            raise
 
-        except Exception:
-            print("Please check your network connection and re-run the script.")
-            exit()
+    def switch_ip(self):
+        print("Switching IP...")
+        # Stop OpenVPN client
+        try:
+            self.stop_openvpn()
+        except Exception as e:
+            print(f"An error occurred while stopping OpenVPN: {e}")
 
-    # This function crawl mobile phones brands and return the list of the brands.
+        # Dispose of the old VM if it exists
+        if self.current_instance_id:
+            self.dispose_vm(self.current_instance_id)
+            self.current_instance_id = None
+
+        # Create a new VM and switch to its IP
+        instance_id = self.create_vm()
+        if instance_id:
+            new_ip = self.get_vm_ip(instance_id)
+            if new_ip:
+                self.update_openvpn_config(new_ip)
+                try:
+                    self.restart_openvpn()
+                    self.current_instance_id = instance_id
+                    print(f"Switched to new IP: {new_ip}")
+                except Exception as e:
+                    print(f"An error occurred: {e}")
+                    self.dispose_vm(instance_id)
+            else:
+                print(f"Failed to get a valid IP for instance {instance_id}")
+
+    def crawl_html_page(self, sub_url):
+        print(f"Crawling HTML page: {sub_url}")
+        url = self.url + sub_url
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+        retry_count = 0
+        while retry_count < self.max_retries:
+            try:
+                response = requests.get(url, timeout=10, headers=headers)
+                if response.status_code == 429:
+                    print(f"429 Too Many Requests: Switching IP...")
+                    self.switch_ip()
+                    continue
+                response.raise_for_status()
+                return BeautifulSoup(response.text, 'html.parser')
+            except requests.exceptions.RequestException as e:
+                print(f"Request failed: {e}. Retrying...")
+                retry_count += 1
+                time.sleep(5)  # Adding delay to prevent rapid retries
+        print(f"Failed to fetch page after {self.max_retries} retries.")
+        return None
+
     def crawl_phone_brands(self):
+        print("Crawling phone brands...")
         phones_brands = []
         soup = self.crawl_html_page('makers.php3')
-        table = soup.find_all('table')[0]
-        table_a = table.find_all('a')
-        for a in table_a:
-            temp = [a['href'].split('-')[0], a.find('span').text.split(' ')[0], a['href']]
-            phones_brands.append(temp)
+        if soup:
+            table = soup.find_all('table')[0]
+            table_a = table.find_all('a')
+            for a in table_a:
+                temp = [a['href'], a.find('span').text.split(' ')[0], a['href']]
+                phones_brands.append(temp)
         return phones_brands
 
-    # This function crawl mobile phones brands models links and return the list of the links.
     def crawl_phones_models(self, phone_brand_link):
-        links = []
-        nav_link = []
+        print(f"Crawling phone models for brand link: {phone_brand_link}")
+        models = []
         soup = self.crawl_html_page(phone_brand_link)
-        nav_data = soup.find(class_='nav-pages')
-        if not nav_data:
-            nav_link.append(phone_brand_link)
-        else:
-            nav_link = nav_data.findAll('a')
-            nav_link = [link['href'] for link in nav_link]
-            nav_link.append(phone_brand_link)
-            nav_link.insert(0, nav_link.pop())
-        for link in nav_link:
-            soup = self.crawl_html_page(link)
+        if soup:
             data = soup.find(class_='section-body')
-            for line1 in data.findAll('a'):
-                links.append(line1['href'])
+            if data:
+                for line in data.findAll('a'):
+                    model_name = line.find('strong').text
+                    model_link = line['href']
+                    models.append((model_name, model_link))
+        return models
 
-        return links
-
-    # This function crawl mobile phones specification and return the list of the all devices list of single brand.
-    def crawl_phones_models_specification(self, link, phone_brand):
-        phone_data = {}
-        soup = self.crawl_html_page(link)
-        model_name = soup.find(class_='specs-phone-name-title').text
-        model_img_html = soup.find(class_='specs-photo-main')
-        model_img = model_img_html.find('img')['src']
-        phone_data.update({"Brand": phone_brand})
-        phone_data.update({"Model Name": model_name})
-        phone_data.update({"Model Image": model_img})
-        temp = []
-        for data1 in range(len(soup.findAll('table'))):
-            table = soup.findAll('table')[data1]
-            for line in table.findAll('tr'):
-                temp = []
-                for l in line.findAll('td'):
-                    text = l.getText()
-                    text = text.strip()
-                    text = text.lstrip()
-                    text = text.rstrip()
-                    text = text.replace("\n", "")
-                    temp.append(text)
-                    if temp[0] in phone_data.keys():
-                        temp[0] = temp[0] + '_1'
-                    if temp[0] not in self.features:
-                        self.features.append(temp[0])
-                if not temp:
-                    continue
-                else:
-                    phone_data.update({temp[0]: temp[1]})
-        return phone_data
-
-    # This function create the folder 'GSMArenaDataset'.
     def create_folder(self):
         if not os.path.exists(self.new_folder_name):
-            os.system('mkdir ' + self.new_folder_name)
-            print("Creating ", self.new_folder_name, " Folder....")
-            time.sleep(6)
-            print("Folder Created.")
+            os.makedirs(self.new_folder_name)
+            print(f"Creating {self.new_folder_name} Folder....")
         else:
-            print(self.new_folder_name , "directory already exists")
+            print(f"{self.new_folder_name} directory already exists")
 
-    # This function check the csv file exists in the 'GSMArenaDataset' directory or not.
-    def check_file_exists(self):
-        return os.listdir(self.absolute_path)
-
-    # This function save the devices specification to csv file.
     def save_specification_to_file(self):
-        phone_brand = self.crawl_phone_brands()
+        print("Starting to save specifications to file...")
+        phone_brands = self.crawl_phone_brands()
         self.create_folder()
-        files_list = self.check_file_exists()
-        for brand in phone_brand:
-            phones_data = []
-            if (brand[0].title() + '.csv') not in files_list:
-                link = self.crawl_phones_models(brand[2])
-                model_value = 1
-                print("Working on", brand[0].title(), "brand.")
-                for value in link:
-                    datum = self.crawl_phones_models_specification(value, brand[0])
-                    datum = { k:v.replace('\n', ' ').replace('\r', ' ') for k,v in datum.items() }
-                    phones_data.append(datum)
-                    print("Completed ", model_value, "/", len(link))
-                    model_value+=1
-                with open(self.absolute_path + '/' + brand[0].title() + ".csv", "w")  as file:
-                    dict_writer = csv.DictWriter(file, fieldnames=self.features)
-                    dict_writer.writeheader()
-                    str_phones_data = json.dumps(phones_data)
-                    encoded = str_phones_data.encode('utf-8')
-                    load_list = json.loads(encoded)
-                    for dicti in load_list:
-                        dict_writer.writerow({k:v.encode('utf-8') for k,v in dicti.items()})
-                print("Data loaded in the file")
-            else:
-                print(brand[0].title() + '.csv file already in your directory.')
+        for brand in phone_brands:
+            print(f"Processing brand: {brand[1]}")
+            csv_file = f"{brand[1]}.csv"
+            csv_file_path = os.path.join(self.absolute_path, csv_file)
+            retry_count = 0
+            while retry_count < self.max_retries:
+                try:
+                    models = self.crawl_phones_models(brand[0])
+                    if models:
+                        with open(csv_file_path, "w", newline='', encoding='utf-8') as file:
+                            writer = csv.writer(file)
+                            writer.writerow(["Model Name", "Model Link"])
+                            for model_name, model_link in models:
+                                writer.writerow([model_name, self.url + model_link])
+                    break  # Break the retry loop if successful
+                except Exception as e:
+                    print(f"Error processing {brand[1]}: {e}. Retrying...")
+                    retry_count += 1
+        print("Completed saving specifications to file.")
 
-
-# This is the main function which create the object of Gsmarena class and call the save_specificiton_to_file function.
-i = 1
-while i == 1:
-    if __name__ == "__main__":
-        obj = Gsmarena()
-        try:
-            obj.save_specification_to_file()
-        except KeyboardInterrupt:
-            print("File has been stopped due to KeyBoard Interruption.")
+if __name__ == "__main__":
+    gsmarena = Gsmarena()
+    gsmarena.save_specification_to_file()
