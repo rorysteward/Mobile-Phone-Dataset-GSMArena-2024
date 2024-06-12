@@ -4,11 +4,13 @@ import csv
 import os
 import time
 import subprocess
+import sys
 
-VULTR_API_KEY = 'ASDSADASDASDASDASDASDASDSA'
-SNAPSHOT_ID = 'ac5e4520-3e21-4703-91e4-9cerwrew'
+VULTR_API_KEY = 'apikey'
+SNAPSHOT_ID = 'snapshot_id'
 REGION = 'ewr'
 PLAN = 'vc2-1c-0.5gb'
+
 class Gsmarena:
     def __init__(self):
         self.url = 'https://www.gsmarena.com/'
@@ -88,7 +90,7 @@ class Gsmarena:
         try:
             result = subprocess.run(['systemctl', 'restart', 'openvpn@client'], check=True, capture_output=True, text=True)
             if result.returncode != 0:
-                raise subprocess.CalledProcessError(result.returncode, result.args, output=result.stdout, stderr=result.stderr)
+                raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
             print("OpenVPN client restarted successfully.")
             time.sleep(5)
         except subprocess.CalledProcessError as e:
@@ -100,7 +102,7 @@ class Gsmarena:
         try:
             result = subprocess.run(['systemctl', 'stop', 'openvpn@client'], check=True, capture_output=True, text=True)
             if result.returncode != 0:
-                raise subprocess.CalledProcessError(result.returncode, result.args, output=result.stdout, stderr=result.stderr)
+                raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
             print("OpenVPN client stopped successfully.")
         except subprocess.CalledProcessError as e:
             print(f"Failed to stop OpenVPN client: {e.stderr}")
@@ -150,6 +152,9 @@ class Gsmarena:
                 response.raise_for_status()
                 return BeautifulSoup(response.text, 'html.parser')
             except requests.exceptions.RequestException as e:
+                if response.status_code == 404:
+                    print(f"404 Not Found for URL: {url}. Stopping further attempts for this URL.")
+                    break
                 print(f"Request failed: {e}. Retrying...")
                 retry_count += 1
                 time.sleep(5)  # Adding delay to prevent rapid retries
@@ -164,22 +169,57 @@ class Gsmarena:
             table = soup.find_all('table')[0]
             table_a = table.find_all('a')
             for a in table_a:
-                temp = [a['href'], a.find('span').text.split(' ')[0], a['href']]
+                href = a['href']
+                make = href.split('-')[0]
+                temp = [href, make, href]
                 phones_brands.append(temp)
         return phones_brands
 
     def crawl_phones_models(self, phone_brand_link):
         print(f"Crawling phone models for brand link: {phone_brand_link}")
         models = []
-        soup = self.crawl_html_page(phone_brand_link)
-        if soup:
-            data = soup.find(class_='section-body')
-            if data:
-                for line in data.findAll('a'):
-                    model_name = line.find('strong').text
-                    model_link = line['href']
-                    models.append((model_name, model_link))
+        page_url = phone_brand_link
+
+        while True:
+            soup = self.crawl_html_page(page_url)
+            if soup:
+                data = soup.find(class_='section-body')
+                if data:
+                    page_models = data.findAll('a')
+                    for line in page_models:
+                        model_name = line.find('strong').text
+                        model_link = line['href']
+                        models.append((model_name, model_link))
+
+                    # Check for 'nav-pages' to determine if there is a next page
+                    nav_pages = soup.find('div', class_='nav-pages')
+                    if nav_pages:
+                        next_page = nav_pages.find('a', class_='prevnextbutton', title='Next page')
+                        if next_page:
+                            page_url = next_page['href']
+                        else:
+                            break  # No more pages, exit loop
+                    else:
+                        break  # No nav-pages div, exit loop
+                else:
+                    break  # No more pages
+            else:
+                break  # Failed to fetch page
         return models
+
+    def crawl_phone_details(self, model_link):
+        print(f"Crawling details for model link: {model_link}")
+        details = {}
+        soup = self.crawl_html_page(model_link)
+        if soup:
+            specs = soup.find('div', class_='article-info')
+            if specs:
+                rows = specs.find_all('tr')
+                for row in rows:
+                    cols = row.find_all('td')
+                    if len(cols) == 2:
+                        details[cols[0].text.strip()] = cols[1].text.strip()
+        return details
 
     def create_folder(self):
         if not os.path.exists(self.new_folder_name):
@@ -188,7 +228,7 @@ class Gsmarena:
         else:
             print(f"{self.new_folder_name} directory already exists")
 
-    def save_specification_to_file(self):
+    def save_specification_to_file(self, full=False):
         print("Starting to save specifications to file...")
         phone_brands = self.crawl_phone_brands()
         self.create_folder()
@@ -203,9 +243,15 @@ class Gsmarena:
                     if models:
                         with open(csv_file_path, "w", newline='', encoding='utf-8') as file:
                             writer = csv.writer(file)
-                            writer.writerow(["Model Name", "Model Link"])
-                            for model_name, model_link in models:
-                                writer.writerow([model_name, self.url + model_link])
+                            if full:
+                                writer.writerow(["Make", "Model Name", "Model Link", "Details"])
+                                for model_name, model_link in models:
+                                    details = self.crawl_phone_details(model_link) if full else {}
+                                    writer.writerow([brand[1], model_name, self.url + model_link, details])
+                            else:
+                                writer.writerow(["Make", "Model Name", "Model Link"])
+                                for model_name, model_link in models:
+                                    writer.writerow([brand[1], model_name, self.url + model_link])
                     break  # Break the retry loop if successful
                 except Exception as e:
                     print(f"Error processing {brand[1]}: {e}. Retrying...")
@@ -213,5 +259,6 @@ class Gsmarena:
         print("Completed saving specifications to file.")
 
 if __name__ == "__main__":
+    full_crawl = len(sys.argv) > 1 and sys.argv[1] == 'full'
     gsmarena = Gsmarena()
-    gsmarena.save_specification_to_file()
+    gsmarena.save_specification_to_file(full=full_crawl)
